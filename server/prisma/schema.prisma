@@ -1,0 +1,56 @@
+// Local default: SQLite (DATABASE_URL=file:./dev.db)
+// Deploy (Supabase / Neon): set provider = "postgresql" and DATABASE_URL — see docs/DATABASE.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum SponsorTier {
+  PLATINUM
+  GOLD
+  SILVER
+  BRONZE
+  COMMUNITY
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+model Sponsor {
+  id             String       @id @default(cuid())
+  name           String
+  slug           String       @unique
+  tier           SponsorTier
+  logoUrl        String?
+  website        String
+  description    String
+  fundsApifyLab  Boolean      @default(false)
+  monthlyBudgetUsd Int?
+  active         Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  campaigns      Campaign[]
+}
+
+model Campaign {
+  id           String         @id @default(cuid())
+  title        String
+  description  String
+  status       CampaignStatus @default(DRAFT)
+  budgetCents  Int            @default(0)
+  startDate    DateTime?
+  endDate      DateTime?
+  sponsorId    String?
+  sponsor      Sponsor?       @relation(fields: [sponsorId], references: [id], onDelete: SetNull)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+}
