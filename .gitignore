@@ -9,3 +9,6 @@ server/prisma/dev.db
 coverage/
 .DS_Store
 *.log
+
+server/data/state.json
+.rocketride/
