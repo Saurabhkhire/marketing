@@ -32,6 +32,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Apify `waitForFinish` for LaunchPad collectors (seconds). Default 90 vs legacy 300 for faster runs. */
+function launchpadApifyWaitSec() {
+  const raw = process.env.APIFY_WAIT_FOR_FINISH_SEC ?? process.env.LAUNCHPAD_APIFY_WAIT_SEC ?? '90';
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) && n > 0 ? Math.max(30, Math.min(Math.floor(n), 300)) : 90;
+}
+
+/** Reddit fallback attempts when earlier queries return no rows (1–4). Default 2. */
+function launchpadRedditAttempts() {
+  const raw = process.env.LAUNCHPAD_REDDIT_ATTEMPTS ?? '2';
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 4) : 2;
+}
+
 async function loadDatasetItems(token, datasetId, maxItems) {
   if (!datasetId) return [];
   const limit = Math.max(1, Math.min(maxItems, 500));
@@ -63,8 +77,13 @@ async function runApifyActor(actorRef, inputOverride = null, waitForFinish = 120
   let datasetId = runData.defaultDatasetId;
   let items = await loadDatasetItems(token, datasetId, maxItems);
 
+  const pollA = Number(process.env.LAUNCHPAD_DATASET_POLL_MS_FIRST || 1000);
+  const pollB = Number(process.env.LAUNCHPAD_DATASET_POLL_MS_RETRY || 800);
+  const pollFirst = Number.isFinite(pollA) ? Math.max(200, pollA) : 1000;
+  const pollRetry = Number.isFinite(pollB) ? Math.max(200, pollB) : 800;
+
   if (!items.length && runData.id) {
-    await sleep(2500);
+    await sleep(pollFirst);
     const refreshed = await fetchActorRun(token, runData.id);
     if (refreshed?.defaultDatasetId) {
       datasetId = refreshed.defaultDatasetId;
@@ -73,7 +92,7 @@ async function runApifyActor(actorRef, inputOverride = null, waitForFinish = 120
   }
 
   if (!items.length && datasetId) {
-    await sleep(2000);
+    await sleep(pollRetry);
     items = await loadDatasetItems(token, datasetId, maxItems);
   }
 
@@ -146,12 +165,13 @@ function dedupeQuotes(quotes, max = 22) {
   return out;
 }
 
-async function runRedditWithFallbacks(searchKw) {
-  const attempts = [
+async function runRedditWithFallbacks(searchKw, waitSec, maxAttempts) {
+  const attemptsAll = [
     { query: broadenKeyword(searchKw), time: 'month', groups: ['RESIDENTIAL'] },
     { query: searchKw.split(/\s+/).slice(0, 4).join(' ') || 'saas startup', time: 'year', groups: ['RESIDENTIAL'] },
     { query: 'b2b saas startup product market', time: 'month', groups: [] }
   ];
+  const attempts = attemptsAll.slice(0, Math.max(1, maxAttempts));
   let last = null;
   for (const a of attempts) {
     const res = await runApifyActor(
@@ -166,7 +186,7 @@ async function runRedditWithFallbacks(searchKw) {
           ? { useApifyProxy: true, apifyProxyGroups: a.groups }
           : { useApifyProxy: true }
       },
-      300,
+      waitSec,
       120
     ).catch((e) => ({ actor: { key: 'reddit_posts_search' }, error: String(e), items: [], query_tried: a.query }));
     last = res;
@@ -578,6 +598,15 @@ async function runLaunchpad({ idea, company_url, input_mode }) {
   };
 
   const p1Start = Date.now();
+  const apifyWait = launchpadApifyWaitSec();
+  const redditAttempts = launchpadRedditAttempts();
+  const skipWebsiteCrawl =
+    /^1|true|yes$/i.test(String(process.env.LAUNCHPAD_SKIP_WEBSITE_CRAWL || '').trim());
+  const techCrunchGapMs = (() => {
+    const n = Number(process.env.LAUNCHPAD_TECHCRUNCH_GAP_MS ?? 800);
+    return Number.isFinite(n) ? Math.max(0, Math.min(n, 10000)) : 800;
+  })();
+
   const useProductHunt = /^1|true|yes$/i.test(String(process.env.LAUNCHPAD_USE_PRODUCTHUNT || '').trim());
   const skipPh = !useProductHunt;
   const skipAllTechcrunch = /^1|true|yes$/i.test(String(process.env.LAUNCHPAD_SKIP_TECHCRUNCH || '').trim());
@@ -592,7 +621,7 @@ async function runLaunchpad({ idea, company_url, input_mode }) {
         : null
     };
     if (!skipPh) {
-      phRun = await runApifyActor('producthunt_runtime', producthuntInput, 300, 50).catch((e) => ({
+      phRun = await runApifyActor('producthunt_runtime', producthuntInput, apifyWait, 50).catch((e) => ({
         actor: { key: 'producthunt_runtime' },
         error: String(e),
         items: []
@@ -610,7 +639,7 @@ async function runLaunchpad({ idea, company_url, input_mode }) {
       tcAi = await runApifyActor(
         'techcrunch',
         { category: 'AI', max_posts: tcPosts },
-        300,
+        apifyWait,
         Math.min(tcPosts + 15, 80)
       ).catch((e) => ({
         actor: { key: 'techcrunch' },
@@ -645,11 +674,11 @@ async function runLaunchpad({ idea, company_url, input_mode }) {
           : 'skipped by default — set LAUNCHPAD_TECHCRUNCH_BOTH=1 for Startups category (uses more Apify memory)'
       };
     } else {
-      await sleep(2000);
+      await sleep(techCrunchGapMs);
       tcSu = await runApifyActor(
         'techcrunch',
         { category: 'Startups', max_posts: tcPosts },
-        300,
+        apifyWait,
         Math.min(tcPosts + 15, 80)
       ).catch((e) => ({
         actor: { key: 'techcrunch' },
@@ -663,23 +692,24 @@ async function runLaunchpad({ idea, company_url, input_mode }) {
   }
 
   const [redditRun, coreTasks, vibestartScout] = await Promise.all([
-    runRedditWithFallbacks(searchKw),
+    runRedditWithFallbacks(searchKw, apifyWait, redditAttempts),
     runCoreCollectors(),
     isUrlMode ? vibestartDirectScrape(companyUrlNormalized) : Promise.resolve({ ok: false, error: 'idea_mode' })
   ]);
-  const websiteTask = isUrlMode
-    ? await runApifyActor(
-        'website_content_crawler',
-        {
-          startUrls: [{ url: companyUrlNormalized }],
-          maxCrawlDepth: 1,
-          maxCrawlPages: 18,
-          maxConcurrency: 2
-        },
-        300,
-        35
-      ).catch((e) => ({ actor: { key: 'website_content_crawler' }, error: String(e), items: [] }))
-    : null;
+  const websiteTask =
+    isUrlMode && !skipWebsiteCrawl
+      ? await runApifyActor(
+          'website_content_crawler',
+          {
+            startUrls: [{ url: companyUrlNormalized }],
+            maxCrawlDepth: 1,
+            maxCrawlPages: 18,
+            maxConcurrency: 2
+          },
+          apifyWait,
+          35
+        ).catch((e) => ({ actor: { key: 'website_content_crawler' }, error: String(e), items: [] }))
+      : null;
 
   const vibestartRun = {
     actor: { key: 'vibestart_site_scout' },
